@@ -2,7 +2,7 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -35,18 +35,20 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let intid = InterruptType::try_from(T::info().reg.data().int_id().read().intid());
+
         match intid {
-            // In case of RxAvailable, We need a way to know that the FIFO level is triggered in task,
-            // but also need to disable the interrupt to clear it (which clears it in intid).
+            // Our requested watermark was reached in the FIFO, or an error occurred.
             //
-            // In case of LineStatus, We don't use a separate flag from RxAvailable because
-            // the RX task will keep reading bytes until it hits the byte that produced the error
-            Ok(InterruptType::LineStatus) | Ok(InterruptType::RxAvailable) => {
-                T::info().reg.data().scr().modify(|w| *w |= int_flag::RX_AVAILABLE);
+            // Either way, read from the FIFO until we encounter an error byte or fill
+            // our buffer.
+            Ok(InterruptType::LineStatus | InterruptType::RxAvailable) => {
                 T::info().reg.data().ien().modify(|w| {
                     w.set_elsi(false);
                     w.set_erdai(false);
                 });
+
+                T::info().rx_buf.fill_from_fifo::<T>();
+                T::info().reg.data().scr().modify(|w| *w |= int_flag::RX_AVAILABLE);
                 T::info().rx_waker.wake();
             }
 
@@ -64,28 +66,24 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             // Alas we have to deal with this, which the RX task will do by falling back into
             // interrupting for every byte.
             Ok(InterruptType::CharacterTimeout) => {
-                T::info().reg.data().scr().modify(|w| *w |= int_flag::TIMEOUT);
                 T::info().reg.data().ien().modify(|w| {
                     w.set_elsi(false);
                     w.set_erdai(false);
                 });
+
+                T::info().rx_buf.read_once::<T>();
+                T::info().reg.data().scr().modify(|w| *w |= int_flag::TIMEOUT);
                 T::info().rx_waker.wake();
             }
 
             // Note: We mark TX empty flag because although we could check LSR for tx empty
-            // in the TX task, doing so will clear error bits in LSR.
-            //
-            // This is important because there is a potential race where even though Line Status
-            // interrupt is higher priority, we disable it above so the interrupt could trigger
-            // again, waking the TX task, which might go before the RX task, and it would end up
-            // accidentally clearing LSR error bits before RX task can see them.
+            // in the TX task, reading LSR clears all error flags which might cause conflicts with
+            // RX, so use this flag to play it safe.
             Ok(InterruptType::TxEmpty) => {
                 T::info().reg.data().scr().modify(|w| *w |= int_flag::TX_EMPTY);
                 T::info().reg.data().ien().modify(|w| w.set_ethrei(false));
                 T::info().tx_waker.wake();
             }
-
-            // Unknown/unsupported interrupt type, so ignore
             _ => (),
         }
     }
@@ -271,6 +269,8 @@ pub enum Error {
     Frame,
     /// RX break interrupt occurred.
     Break,
+    /// Other error occurred.
+    Other,
 }
 
 /// UART RX error.
@@ -296,6 +296,7 @@ impl core::fmt::Display for RxError {
             Error::Parity => write!(f, "RX parity error occurred."),
             Error::Frame => write!(f, "RX frame error occurred."),
             Error::Break => write!(f, "RX break interrupt occurred."),
+            Error::Other => write!(f, "Other error occurred."),
         }
     }
 }
@@ -559,11 +560,6 @@ impl<'d, M: Mode> UartRx<'d, M> {
         }
     }
 
-    fn nb_read_byte(&mut self) -> Result<u8, Error> {
-        let lsr = self.info.reg.data().lsr().read();
-        self.read_inner(lsr)
-    }
-
     fn blocking_read_byte(&mut self) -> Result<u8, Error> {
         // LSR clears error bits on read so want to make sure only read it once after data ready
         let lsr = loop {
@@ -643,51 +639,69 @@ impl<'d> UartRx<'d, Async> {
         });
     }
 
-    async fn read_byte(&mut self) -> Result<u8, Error> {
-        // LSR clears error bits on read so want to make sure only read it once when data ready then check bits
-        let lsr = {
-            let lsr = self.info.reg.data().lsr().read();
-            if !lsr.data_ready() {
-                let _ = self.wait_rx_ready().await;
-                self.info.reg.data().lsr().read()
-            } else {
-                lsr
-            }
-        };
+    async fn read_fifo(&mut self, bytes_read_start: usize) -> Result<bool, RxError> {
+        if self.wait_rx_ready().await {
+            if self.info.rx_buf.lsr().overrun() || self.info.rx_buf.lsr().fifo_err() {
+                let err = if self.info.rx_buf.lsr().overrun() {
+                    Error::Overrun
+                } else if self.info.rx_buf.lsr().pe() {
+                    Error::Parity
+                } else if self.info.rx_buf.lsr().frame_err() {
+                    Error::Frame
+                } else if self.info.rx_buf.lsr().brk_intr() {
+                    Error::Break
+                } else {
+                    Error::Other
+                };
 
-        self.read_inner(lsr)
+                Err(RxError {
+                    bytes_read: bytes_read_start + self.info.rx_buf.recvd(),
+                    err,
+                })
+            } else {
+                Ok(true)
+            }
+        } else {
+            Ok(false)
+        }
     }
 
     async fn read_chunk(&mut self, chunk: &mut [u8], bytes_read_start: usize) -> Result<(), RxError> {
         self.set_fifo_trigger(RxFifoTrigger::_1);
+
         for (bytes_read, byte) in chunk.iter_mut().enumerate() {
-            *byte = self.read_byte().await.map_err(|err| RxError {
-                bytes_read: bytes_read_start + bytes_read,
-                err,
+            self.info.rx_buf.set(core::slice::from_mut(byte));
+            self.read_fifo(bytes_read_start).await.map_err(|e| {
+                error!("Unbatched RX error: {:?}", e.err);
+                RxError {
+                    bytes_read: bytes_read_start + bytes_read,
+                    err: e.err,
+                }
             })?;
         }
         Ok(())
     }
 
     async fn read_chunk_batched(&mut self, chunk: &mut [u8], bytes_read_start: usize) -> Result<(), RxError> {
-        // If our FIFO level was reached without timeout, we can read all the bytes in one go,
-        // but still need to check each byte for an error
-        if self.wait_rx_ready().await {
-            for (bytes_read, byte) in chunk.iter_mut().enumerate() {
-                *byte = self.nb_read_byte().map_err(|err| RxError {
-                    bytes_read: bytes_read_start + bytes_read,
-                    err,
-                })?;
+        self.info.rx_buf.set(chunk);
+
+        // If our FIFO level was reached without timeout,
+        // our entire chunk has been filled with data (assuming no error in LSR)
+        let res = match self.read_fifo(bytes_read_start).await {
+            Ok(true) => Ok(()),
+            Err(e) => {
+                error!("Batched RX error: {:?}", e);
+                Err(e)
             }
 
-        // However, if a timeout occured, our assumptions about the number of bytes in the FIFO
-        // no longer holds (since we have to read a byte to clear the timeout interrupt), meaning
-        // we have no choice but to unfortunately fall back on byte-by-byte interrupts
-        } else {
-            self.read_chunk(chunk, bytes_read_start).await?;
-        }
+            // However, if a timeout occured, our assumptions about the number of bytes in the FIFO
+            // no longer holds (since we have to read a byte to clear the timeout interrupt), meaning
+            // we have no choice but to unfortunately fall back on byte-by-byte interrupts
+            Ok(false) => self.read_chunk(chunk, bytes_read_start).await,
+        };
 
-        Ok(())
+        self.info.rx_buf.clear();
+        res
     }
 
     async fn read_chunks<const N: usize>(
@@ -882,11 +896,93 @@ impl<'d, M: Mode> Drop for UartTx<'d, M> {
     }
 }
 
+struct RxBuf {
+    buf: AtomicPtr<u8>,
+    len: AtomicUsize,
+    lsr: AtomicU8,
+    recvd: AtomicUsize,
+}
+
+impl RxBuf {
+    const fn new() -> Self {
+        Self {
+            buf: AtomicPtr::new(core::ptr::null_mut()),
+            len: AtomicUsize::new(0),
+            lsr: AtomicU8::new(0),
+            recvd: AtomicUsize::new(0),
+        }
+    }
+
+    fn fill_from_fifo<T: Instance>(&self) {
+        if !self.buf.load(Ordering::Relaxed).is_null() {
+            for bytes_read in 0..self.len() {
+                let lsr = T::info().reg.data().lsr().read();
+                let byte = T::info().reg.data().rx_dat().read();
+
+                if lsr.brk_intr() || lsr.frame_err() || lsr.pe() || lsr.overrun() {
+                    self.lsr.store(lsr.0, Ordering::Relaxed);
+                    self.recvd.store(bytes_read, Ordering::Relaxed);
+                    return;
+                }
+
+                // SAFETY: TODO
+                unsafe { *self.buf.load(Ordering::Relaxed) = byte }
+                self.buf.fetch_byte_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn read_once<T: Instance>(&self) {
+        if !self.buf.load(Ordering::Relaxed).is_null() {
+            let lsr = T::info().reg.data().lsr().read();
+            let byte = T::info().reg.data().rx_dat().read();
+
+            if lsr.brk_intr() || lsr.frame_err() || lsr.pe() || lsr.overrun() {
+                self.lsr.store(lsr.0, Ordering::Relaxed);
+                self.recvd.store(0, Ordering::Relaxed);
+                return;
+            }
+
+            // SAFETY: TODO
+            unsafe { *self.buf.load(Ordering::Relaxed) = byte }
+            self.buf.fetch_byte_add(1, Ordering::Relaxed);
+            self.len.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    fn set(&self, buf: &mut [u8]) {
+        self.buf.store(buf.as_mut_ptr(), Ordering::Release);
+        self.len.store(buf.len(), Ordering::Release);
+        self.lsr.store(0, Ordering::Release);
+        self.recvd.store(0, Ordering::Release);
+    }
+
+    fn lsr(&self) -> DataLsr {
+        DataLsr(self.lsr.load(Ordering::Acquire))
+    }
+
+    fn recvd(&self) -> usize {
+        self.recvd.load(Ordering::Acquire)
+    }
+
+    fn clear(&self) {
+        self.buf.store(core::ptr::null_mut(), Ordering::Release);
+        self.len.store(0, Ordering::Release);
+        self.lsr.store(0, Ordering::Release);
+        self.recvd.store(0, Ordering::Release);
+    }
+}
+
 struct Info {
     reg: Uart0,
     rx_tx_refcount: AtomicU8,
     rx_waker: AtomicWaker,
     tx_waker: AtomicWaker,
+    rx_buf: RxBuf,
 }
 
 trait SealedMode {}
@@ -926,6 +1022,7 @@ macro_rules! impl_instance {
                     rx_tx_refcount: AtomicU8::new(0),
                     rx_waker: AtomicWaker::new(),
                     tx_waker: AtomicWaker::new(),
+                    rx_buf: RxBuf::new(),
                 };
                 &INFO
             }
