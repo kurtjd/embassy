@@ -302,11 +302,7 @@ impl core::fmt::Display for RxError {
 
 impl core::error::Error for RxError {}
 
-fn init<'d, T: Instance>(
-    _rx_pin: Option<&Peri<'d, AnyPin>>,
-    _tx_pin: Option<&Peri<'d, AnyPin>>,
-    config: Config,
-) -> Result<(), Error> {
+fn init<T: Instance>(config: Config) -> Result<(), Error> {
     // Ensure baudrate is nonzero
     let divisor = u32::from(config.clk_src)
         .checked_div(16 * config.baudrate)
@@ -316,26 +312,6 @@ fn init<'d, T: Instance>(
     if divisor > 0x7FFF {
         return Err(Error::InvalidBaud);
     };
-
-    // Configure pins
-    critical_section::with(|_| {
-        if let Some(rx) = _rx_pin {
-            rx.regs().ctrl1.modify(|w| {
-                w.set_mux_ctrl(pac::Function::F1);
-                w.set_dir(pac::Dir::INPUT);
-                w.set_inp_dis(false);
-                w.set_pu_pd(pac::Pull::NONE);
-            })
-        }
-        if let Some(tx) = _tx_pin {
-            tx.regs().ctrl1.modify(|w| {
-                w.set_mux_ctrl(pac::Function::F1);
-                w.set_dir(pac::Dir::OUTPUT);
-                w.set_inp_dis(true);
-                w.set_pu_pd(pac::Pull::NONE);
-            })
-        }
-    });
 
     // Set config
     T::info().reg.data().cfg_sel().write(|w| {
@@ -411,15 +387,42 @@ pub struct Uart<'d, M: Mode> {
 
 impl<'d, M: Mode> Uart<'d, M> {
     fn new_inner<T: Instance>(
-        _rx_pin: Peri<'d, impl RxPin<T>>,
-        _tx_pin: Peri<'d, impl TxPin<T>>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        let rx_pin = _rx_pin.into();
-        let tx_pin = _tx_pin.into();
-        init::<T>(Some(&rx_pin), Some(&tx_pin), config)?;
-        let rx = UartRx::new_inner::<T>(rx_pin);
-        let tx = UartTx::new_inner::<T>(tx_pin);
+        init::<T>(config)?;
+        rx_pin.setup();
+        tx_pin.setup();
+        let rx = UartRx::new_inner::<T>(rx_pin.into(), None);
+        let tx = UartTx::new_inner::<T>(tx_pin.into(), None);
+        Ok(Self { rx, tx })
+    }
+
+    fn new_inner_with_rtscts<T: Instance>(
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
+        rts_pin: Peri<'d, impl RtsPin<T>>,
+        cts_pin: Peri<'d, impl CtsPin<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        init::<T>(config)?;
+        rx_pin.setup();
+        tx_pin.setup();
+        rts_pin.setup();
+        /*critical_section::with(|_| {
+            rts_pin.regs().ctrl1.modify(|w| {
+                w.set_mux_ctrl(pac::Function::GPIO);
+                w.set_dir(pac::Dir::OUTPUT);
+                w.set_inp_dis(true);
+                w.set_pu_pd(pac::Pull::NONE);
+                w.set_alt_data(true);
+                w.set_out_sel(crate::pac::Sel::PIN);
+            });
+        });*/
+        cts_pin.setup();
+        let rx = UartRx::new_inner::<T>(rx_pin.into(), Some(rts_pin.into()));
+        let tx = UartTx::new_inner::<T>(tx_pin.into(), Some(cts_pin.into()));
         Ok(Self { rx, tx })
     }
 
@@ -466,11 +469,28 @@ impl<'d> Uart<'d, Blocking> {
     /// given clock source.
     pub fn new_blocking<T: Instance>(
         _peri: Peri<'d, T>,
-        _rx_pin: Peri<'d, impl RxPin<T>>,
-        _tx_pin: Peri<'d, impl TxPin<T>>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        Self::new_inner(_rx_pin, _tx_pin, config)
+        Self::new_inner(rx_pin, tx_pin, config)
+    }
+
+    /// Create a new blocking UART driver instance with given configuration and RTS/CTS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaud`] if the supplied baud rate can not be represented by
+    /// given clock source.
+    pub fn new_blocking_with_rtscts<T: Instance>(
+        _peri: Peri<'d, T>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
+        rts_pin: Peri<'d, impl RtsPin<T>>,
+        cts_pin: Peri<'d, impl CtsPin<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        Self::new_inner_with_rtscts(rx_pin, tx_pin, rts_pin, cts_pin, config)
     }
 }
 
@@ -483,12 +503,32 @@ impl<'d> Uart<'d, Async> {
     /// given clock source.
     pub fn new_async<T: Instance>(
         _peri: Peri<'d, T>,
-        _rx_pin: Peri<'d, impl RxPin<T>>,
-        _tx_pin: Peri<'d, impl TxPin<T>>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        let uart = Self::new_inner(_rx_pin, _tx_pin, config)?;
+        let uart = Self::new_inner(rx_pin, tx_pin, config)?;
+        interrupt_en::<T>();
+        Ok(uart)
+    }
+
+    /// Create a new async UART driver instance with given configuration and RTS/CTS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaud`] if the supplied baud rate can not be represented by
+    /// given clock source.
+    pub fn new_async_with_rtscts<T: Instance>(
+        _peri: Peri<'d, T>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
+        rts_pin: Peri<'d, impl RtsPin<T>>,
+        cts_pin: Peri<'d, impl CtsPin<T>>,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        let uart = Self::new_inner_with_rtscts(rx_pin, tx_pin, rts_pin, cts_pin, config)?;
         interrupt_en::<T>();
         Ok(uart)
     }
@@ -517,16 +557,18 @@ impl<'d> Uart<'d, Async> {
 pub struct UartRx<'d, M: Mode> {
     info: &'static Info,
     _rx_pin: Peri<'d, AnyPin>,
+    _rts_pin: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<&'d M>,
 }
 
 impl<'d, M: Mode> UartRx<'d, M> {
-    fn new_inner<T: Instance>(_rx_pin: Peri<'d, AnyPin>) -> Self {
+    fn new_inner<T: Instance>(_rx_pin: Peri<'d, AnyPin>, _rts_pin: Option<Peri<'d, AnyPin>>) -> Self {
         T::info().rx_tx_refcount.fetch_add(1, Ordering::AcqRel);
 
         Self {
             info: T::info(),
             _rx_pin,
+            _rts_pin,
             _phantom: PhantomData,
         }
     }
@@ -576,18 +618,34 @@ impl<'d, M: Mode> UartRx<'d, M> {
         self.read_inner(lsr)
     }
 
-    /// Reads bytes from RX FIFO until buffer is full, blocking if empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RxError`] if error occurred during read.
-    pub fn blocking_read(&mut self, buf: &mut [u8]) -> Result<(), RxError> {
+    fn blocking_read_inner(&mut self, buf: &mut [u8]) -> Result<(), RxError> {
         // If we encounter an error, return the number of valid bytes read up until error occurred
         for (bytes_read, byte) in buf.iter_mut().enumerate() {
             *byte = self.blocking_read_byte().map_err(|err| RxError { bytes_read, err })?;
         }
 
         Ok(())
+    }
+
+    /// Reads bytes from RX FIFO until buffer is full, blocking if empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RxError`] if error occurred during read.
+    pub fn blocking_read(&mut self, buf: &mut [u8]) -> Result<(), RxError> {
+        if self._rts_pin.is_some() {
+            self.info.reg.data().mcr().modify(|w| w.set_rts(true));
+            // Theoretically during the read here the FIFO could overrun, but that would
+            // take an extremely high baud rate since we are draining the FIFO in a tight loop.
+            //
+            // So, don't bother with the complicated logic for that but it's noted here in case
+            // this assumption turns out wrong and we do end up needing that extra logic.
+            let res = self.blocking_read_inner(buf);
+            self.info.reg.data().mcr().modify(|w| w.set_rts(false));
+            res
+        } else {
+            self.blocking_read_inner(buf)
+        }
     }
 }
 
@@ -600,12 +658,30 @@ impl<'d> UartRx<'d, Blocking> {
     /// given clock source.
     pub fn new_blocking<T: Instance>(
         _peri: Peri<'d, T>,
-        _rx_pin: Peri<'d, impl RxPin<T>>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        let rx_pin = _rx_pin.into();
-        init::<T>(Some(&rx_pin), None, config)?;
-        Ok(Self::new_inner::<T>(rx_pin))
+        init::<T>(config)?;
+        rx_pin.setup();
+        Ok(Self::new_inner::<T>(rx_pin.into(), None))
+    }
+
+    /// Create a new blocking RX-only UART driver instance with given configuration and RTS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaud`] if the supplied baud rate can not be represented by
+    /// given clock source.
+    pub fn new_blocking_with_rts<T: Instance>(
+        _peri: Peri<'d, T>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        rts_pin: Peri<'d, impl RtsPin<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        init::<T>(config)?;
+        rx_pin.setup();
+        rts_pin.setup();
+        Ok(Self::new_inner::<T>(rx_pin.into(), Some(rts_pin.into())))
     }
 }
 
@@ -711,14 +787,34 @@ impl<'d> UartRx<'d, Async> {
     /// given clock source.
     pub fn new_async<T: Instance>(
         _peri: Peri<'d, T>,
-        _rx_pin: Peri<'d, impl RxPin<T>>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        let rx_pin = _rx_pin.into();
-        init::<T>(Some(&rx_pin), None, config)?;
+        init::<T>(config)?;
         interrupt_en::<T>();
-        Ok(Self::new_inner::<T>(rx_pin))
+        rx_pin.setup();
+        Ok(Self::new_inner::<T>(rx_pin.into(), None))
+    }
+
+    /// Create a new async RX-only UART driver instance with given configuration and RTS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaud`] if the supplied baud rate can not be represented by
+    /// given clock source.
+    pub fn new_async_with_rts<T: Instance>(
+        _peri: Peri<'d, T>,
+        rx_pin: Peri<'d, impl RxPin<T>>,
+        rts_pin: Peri<'d, impl RtsPin<T>>,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        init::<T>(config)?;
+        interrupt_en::<T>();
+        rx_pin.setup();
+        rts_pin.setup();
+        Ok(Self::new_inner::<T>(rx_pin.into(), Some(rts_pin.into())))
     }
 
     /// Reads bytes from RX FIFO until buffer is full.
@@ -770,16 +866,18 @@ impl<'d, M: Mode> Drop for UartRx<'d, M> {
 pub struct UartTx<'d, M: Mode> {
     info: &'static Info,
     _tx_pin: Peri<'d, AnyPin>,
+    _cts_pin: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<&'d M>,
 }
 
 impl<'d, M: Mode> UartTx<'d, M> {
-    fn new_inner<T: Instance>(_tx_pin: Peri<'d, AnyPin>) -> Self {
+    fn new_inner<T: Instance>(_tx_pin: Peri<'d, AnyPin>, _cts_pin: Option<Peri<'d, AnyPin>>) -> Self {
         T::info().rx_tx_refcount.fetch_add(1, Ordering::AcqRel);
 
         Self {
             info: T::info(),
             _tx_pin,
+            _cts_pin,
             _phantom: PhantomData,
         }
     }
@@ -790,11 +888,26 @@ impl<'d, M: Mode> UartTx<'d, M> {
         }
     }
 
+    fn write_chunk_with_cts(&mut self, chunk: &[u8]) {
+        for byte in chunk {
+            // We have to poll CTS every byte since hardware doesn't help us
+            while !self.info.reg.data().msr().read().n_cts() {}
+            self.info.reg.data().tx_dat().write(|w| *w = *byte);
+        }
+    }
+
     /// Writes bytes to TX FIFO, blocking if full.
     pub fn blocking_write(&mut self, buf: &[u8]) {
-        for chunk in buf.chunks(FIFO_SZ) {
-            while !self.info.reg.data().lsr().read().trans_empty() {}
-            self.write_chunk(chunk);
+        if self._cts_pin.is_some() {
+            for chunk in buf.chunks(FIFO_SZ) {
+                while !self.info.reg.data().lsr().read().trans_empty() {}
+                self.write_chunk_with_cts(chunk);
+            }
+        } else {
+            for chunk in buf.chunks(FIFO_SZ) {
+                while !self.info.reg.data().lsr().read().trans_empty() {}
+                self.write_chunk(chunk);
+            }
         }
     }
 
@@ -815,12 +928,30 @@ impl<'d> UartTx<'d, Blocking> {
     /// given clock source.
     pub fn new_blocking<T: Instance>(
         _peri: Peri<'d, T>,
-        _tx_pin: Peri<'d, impl TxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        let tx_pin = _tx_pin.into();
-        init::<T>(None, Some(&tx_pin), config)?;
-        Ok(Self::new_inner::<T>(tx_pin))
+        init::<T>(config)?;
+        tx_pin.setup();
+        Ok(Self::new_inner::<T>(tx_pin.into(), None))
+    }
+
+    /// Create a new blocking TX-only UART driver instance with given configuration and CTS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaud`] if the supplied baud rate can not be represented by
+    /// given clock source.
+    pub fn new_blocking_with_cts<T: Instance>(
+        _peri: Peri<'d, T>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
+        cts_pin: Peri<'d, impl CtsPin<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        init::<T>(config)?;
+        tx_pin.setup();
+        cts_pin.setup();
+        Ok(Self::new_inner::<T>(tx_pin.into(), Some(cts_pin.into())))
     }
 }
 
@@ -847,14 +978,34 @@ impl<'d> UartTx<'d, Async> {
     /// given clock source.
     pub fn new_async<T: Instance>(
         _peri: Peri<'d, T>,
-        _tx_pin: Peri<'d, impl TxPin<T>>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
         _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
         config: Config,
     ) -> Result<Self, Error> {
-        let tx_pin = _tx_pin.into();
-        init::<T>(None, Some(&tx_pin), config)?;
+        init::<T>(config)?;
         interrupt_en::<T>();
-        Ok(Self::new_inner::<T>(tx_pin))
+        tx_pin.setup();
+        Ok(Self::new_inner::<T>(tx_pin.into(), None))
+    }
+
+    /// Create a new async TX-only UART driver instance with given configuration and CTS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaud`] if the supplied baud rate can not be represented by
+    /// given clock source.
+    pub fn new_async_with_cts<T: Instance>(
+        _peri: Peri<'d, T>,
+        tx_pin: Peri<'d, impl TxPin<T>>,
+        cts_pin: Peri<'d, impl CtsPin<T>>,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>>,
+        config: Config,
+    ) -> Result<Self, Error> {
+        init::<T>(config)?;
+        interrupt_en::<T>();
+        tx_pin.setup();
+        cts_pin.setup();
+        Ok(Self::new_inner::<T>(tx_pin.into(), Some(cts_pin.into())))
     }
 
     /// Writes bytes to TX FIFO.
@@ -946,23 +1097,123 @@ impl_instance!(UART0, 0);
 impl_instance!(UART1, 1);
 
 /// A pin that can be configured as a UART RX pin.
-pub trait RxPin<T: Instance>: Pin + PeripheralType {}
+pub trait RxPin<T: Instance>: Pin + PeripheralType {
+    fn setup(&self);
+}
 
 /// A pin that can be configured as a UART TX pin.
-pub trait TxPin<T: Instance>: Pin + PeripheralType {}
+pub trait TxPin<T: Instance>: Pin + PeripheralType {
+    fn setup(&self);
+}
 
-macro_rules! impl_pin {
-    ($function:ident, $peri:ident, $($pin:ident),*) => {
+/// A pin that can be configured as a UART RTS pin.
+pub trait RtsPin<T: Instance>: Pin + PeripheralType {
+    fn setup(&self);
+}
+
+/// A pin that can be configured as a UART CTS pin.
+pub trait CtsPin<T: Instance>: Pin + PeripheralType {
+    fn setup(&self);
+}
+
+macro_rules! impl_input_pin {
+    ($function:ident, $peri:ident, $($pin:ident, $mux:ident),*) => {
         $(
-            impl $function<peripherals::$peri> for peripherals::$pin {}
+            impl $function<peripherals::$peri> for peripherals::$pin {
+                fn setup(&self) {
+                    critical_section::with(|_| {
+                        self.regs().ctrl1.modify(|w| {
+                            w.set_mux_ctrl(pac::Function::$mux);
+                            w.set_dir(pac::Dir::INPUT);
+                            w.set_inp_dis(false);
+                            w.set_pu_pd(pac::Pull::NONE);
+                        });
+                    });
+                }
+            }
         )*
     }
 }
 
-impl_pin!(RxPin, UART0, GPIO105);
-impl_pin!(TxPin, UART0, GPIO104);
-impl_pin!(RxPin, UART1, GPIO171, GPIO255);
-impl_pin!(TxPin, UART1, GPIO170);
+macro_rules! impl_output_pin {
+    ($function:ident, $peri:ident, $($pin:ident, $mux:ident),*) => {
+        $(
+            impl $function<peripherals::$peri> for peripherals::$pin {
+                fn setup(&self) {
+                    critical_section::with(|_| {
+                        self.regs().ctrl1.modify(|w| {
+                            w.set_mux_ctrl(pac::Function::$mux);
+                            w.set_dir(pac::Dir::OUTPUT);
+                            w.set_inp_dis(true);
+                            w.set_pu_pd(pac::Pull::NONE);
+                        });
+                    });
+                }
+            }
+        )*
+    }
+}
+
+#[rustfmt::skip]
+impl_input_pin!(
+    RxPin,
+    UART0,
+    GPIO105, F1
+);
+
+#[rustfmt::skip]
+impl_output_pin!(
+    TxPin,
+    UART0,
+    GPIO104, F1
+);
+
+#[rustfmt::skip]
+impl_output_pin!(
+    RtsPin,
+    UART0,
+    GPIO144, F2,
+    GPIO225, F1
+);
+
+#[rustfmt::skip]
+impl_input_pin!(
+    CtsPin,
+    UART0,
+    GPIO143, F2,
+    GPIO127, F3
+);
+
+#[rustfmt::skip]
+impl_input_pin!(
+    RxPin,
+    UART1,
+    GPIO171, F1,
+    GPIO255, F1
+);
+
+#[rustfmt::skip]
+impl_output_pin!(
+    TxPin,
+    UART1,
+    GPIO170, F1
+);
+
+#[rustfmt::skip]
+impl_output_pin!(
+    RtsPin,
+    UART1,
+    GPIO127, F2,
+    GPIO134, F2
+);
+
+#[rustfmt::skip]
+impl_input_pin!(
+    CtsPin,
+    UART1,
+    GPIO40, F3, // Revisit: Datasheet is crap for this?
+    GPIO135, F1
+);
 
 impl<'d, M: Mode> embedded_hal_02::blocking::serial::Write<u8> for Uart<'d, M> {
     type Error = core::convert::Infallible;
